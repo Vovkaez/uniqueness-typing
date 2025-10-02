@@ -13,8 +13,8 @@ newtype PrettyBoolean = PB Boolean deriving (Show)
 instance PP.Pretty PrettyBoolean where
   pretty :: PrettyBoolean -> PP.Doc ann
   pretty (PB b) = case b of
-    BoolTrue -> pretty "1"
-    BoolFalse -> pretty "0"
+    BoolTrue -> pretty "•"
+    BoolFalse -> pretty "×"
     BoolVariable x -> pretty "u" <> pretty x
     BoolAnd x y -> binOp x y "∧"
     BoolOr x y -> binOp x y "∨"
