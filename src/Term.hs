@@ -13,6 +13,7 @@ where
 
 import Boolean (BoolVariableID, Boolean (BoolFalse, BoolVariable), mkOr)
 import qualified Boolean (substitute, unify, variables)
+import Control.Monad.State.Lazy (State, evalState, get, put)
 import Data.Bifunctor (bimap)
 import Substitution (subOne)
 
@@ -83,6 +84,9 @@ data Type
 
 getUniqueness :: Type -> Boolean
 getUniqueness (Attr _ u) = u
+
+getTypeT :: Type -> TypeT
+getTypeT (Attr t _) = t
 
 data SomeType
   = A Type
@@ -172,50 +176,65 @@ unify eqs = do
   newEqs <- unifyOnce [] eqs
   if newEqs == eqs then return (subTFromEqs eqs, subUFromEqs eqs) else unify newEqs
 
-builtinUnaryOpEquations :: [Type] -> TypeVariableID -> BoolVariableID -> Term -> TypeT -> (Equations, Type, TypeVariableID, BoolVariableID)
-builtinUnaryOpEquations varTypes nextTypeIdx nextUniqIdx a resType =
-  let (aEqs, aType, aNextTypeIdx, aNextUniqIdx) = mkTypeEquations varTypes nextTypeIdx nextUniqIdx a
-      resT = Attr resType $ BoolVariable aNextUniqIdx
-   in ((A aType, A resT) : aEqs, resT, aNextTypeIdx, aNextUniqIdx + 1)
+type StateIDs a = State (TypeVariableID, BoolVariableID) a
 
-builtinBinaryOpEquations :: [Type] -> TypeVariableID -> BoolVariableID -> Term -> Term -> TypeT -> (Equations, Type, TypeVariableID, BoolVariableID)
-builtinBinaryOpEquations varTypes nextTypeIdx nextUniqIdx a b resType =
-  let (aEqs, aType, aNextTypeIdx, aNextUniqIdx) = mkTypeEquations varTypes nextTypeIdx nextUniqIdx a
-      (bEqs, bType, bNextTypeIdx, bNextUniqIdx) = mkTypeEquations varTypes aNextTypeIdx aNextUniqIdx b
-      resT = Attr resType $ BoolVariable bNextUniqIdx
-   in ((A aType, A resT) : (A bType, A resT) : (aEqs ++ bEqs), resT, bNextTypeIdx, bNextUniqIdx + 1)
+builtinZeroOpEquations :: TypeT -> StateIDs (Equations, Type)
+builtinZeroOpEquations t = do
+  (tIdx, uIdx) <- get
+  put (tIdx, uIdx + 1)
+  return ([], Attr t (BoolVariable uIdx))
 
--- TODO: pass idx via state monad
-mkTypeEquations :: [Type] -> TypeVariableID -> BoolVariableID -> Term -> (Equations, Type, TypeVariableID, BoolVariableID)
-mkTypeEquations varTypes nextTypeIdx nextUniqIdx = \case
-  TermVariable True idx -> ([], varTypes !! idx, nextTypeIdx, nextUniqIdx) -- TODO: free variables
-  TermVariable False idx -> let t = varTypes !! idx in ([(U $ getUniqueness t, U BoolFalse)], t, nextTypeIdx, nextUniqIdx)
-  TermAbstraction term ->
-    let varType = Attr (TypeVariable nextTypeIdx) (BoolVariable nextUniqIdx)
-        (eqs, t, retNextTypeIdx, retNextUniqIdx) = mkTypeEquations (varType : varTypes) (nextTypeIdx + 1) (nextUniqIdx + 1) term
-     in (eqs, Attr (TypeArrow varType t) (foldl (\b -> mkOr b . getUniqueness) BoolFalse varTypes), retNextTypeIdx, retNextUniqIdx)
-  TermApplication a b ->
-    let (aEqs, aType, aNextTypeIdx, aNextUniqIdx) = mkTypeEquations varTypes nextTypeIdx nextUniqIdx a
-        (bEqs, bType, bNextTypeIdx, bNextUniqIdx) = mkTypeEquations varTypes aNextTypeIdx aNextUniqIdx b
-        varType = Attr (TypeVariable bNextTypeIdx) (BoolVariable bNextUniqIdx)
-     in ((A aType, A $ Attr (TypeArrow bType varType) (BoolVariable $ bNextUniqIdx + 1)) : (aEqs ++ bEqs), varType, bNextTypeIdx + 1, bNextUniqIdx + 2)
+builtinUnaryOpEquations :: [Type] -> Term -> TypeT -> StateIDs (Equations, Type)
+builtinUnaryOpEquations varTypes a resType = do
+  (eqs, tp) <- mkTypeEquations varTypes a
+  (tIdx, uIdx) <- get
+  put (tIdx, uIdx + 1)
+  let resT = Attr resType $ BoolVariable uIdx
+  return ((T $ getTypeT tp, T resType) : eqs, resT)
+
+builtinBinaryOpEquations :: [Type] -> Term -> Term -> TypeT -> StateIDs (Equations, Type)
+builtinBinaryOpEquations varTypes a b resType = do
+  (aEqs, aTp) <- mkTypeEquations varTypes a
+  (bEqs, bTp) <- mkTypeEquations varTypes b
+  (tIdx, uIdx) <- get
+  put (tIdx, uIdx + 1)
+  let resT = Attr resType $ BoolVariable uIdx
+  return ((T $ getTypeT aTp, T resType) : (T $ getTypeT bTp, T resType) : (aEqs ++ bEqs), resT)
+
+mkTypeEquations :: [Type] -> Term -> StateIDs (Equations, Type)
+mkTypeEquations varTypes = \case
+  TermVariable True idx -> return ([], varTypes !! idx) -- TODO: free variables
+  TermVariable False idx -> let t = varTypes !! idx in return ([(U $ getUniqueness t, U BoolFalse)], t)
+  TermAbstraction term -> do
+    (tIdx, uIdx) <- get
+    put (tIdx + 1, uIdx + 1)
+    let varType = Attr (TypeVariable tIdx) (BoolVariable uIdx)
+    (eqs, t) <- mkTypeEquations (varType : varTypes) term
+    return (eqs, Attr (TypeArrow varType t) (foldl (\b -> mkOr b . getUniqueness) BoolFalse varTypes))
+  TermApplication a b -> do
+    (aEqs, aType) <- mkTypeEquations varTypes a
+    (bEqs, bType) <- mkTypeEquations varTypes b
+    (tIdx, uIdx) <- get
+    put (tIdx + 1, uIdx + 2)
+    let varType = Attr (TypeVariable tIdx) (BoolVariable uIdx)
+    return ((A aType, A $ Attr (TypeArrow bType varType) (BoolVariable $ uIdx + 1)) : (aEqs ++ bEqs), varType)
   TermBuiltIn b ->
-    let binOpInt = \l r -> builtinBinaryOpEquations varTypes nextTypeIdx nextUniqIdx l r TypeInt
-        binOpBool = \l r -> builtinBinaryOpEquations varTypes nextTypeIdx nextUniqIdx l r TypeBool
+    let binOpInt = \l r -> builtinBinaryOpEquations varTypes l r TypeInt
+        binOpBool = \l r -> builtinBinaryOpEquations varTypes l r TypeBool
      in case b of
-          BuiltInInt _ -> ([], Attr TypeInt (BoolVariable nextUniqIdx), nextTypeIdx, nextUniqIdx + 1)
+          BuiltInInt _ -> builtinZeroOpEquations TypeInt
           BuiltInSum l r -> binOpInt l r
           BuiltInSub l r -> binOpInt l r
           BuiltInMul l r -> binOpInt l r
           BuiltInDiv l r -> binOpInt l r
-          BuiltInBool _ -> ([], Attr TypeBool (BoolVariable nextUniqIdx), nextTypeIdx, nextUniqIdx + 1)
+          BuiltInBool _ -> builtinZeroOpEquations TypeBool
           BuiltInAnd l r -> binOpBool l r
           BuiltInOr l r -> binOpBool l r
-          BuiltInNot a -> builtinUnaryOpEquations varTypes nextTypeIdx nextUniqIdx a TypeBool
+          BuiltInNot a -> builtinUnaryOpEquations varTypes a TypeBool
 
 reconstructType :: Term -> Maybe Type
 reconstructType term =
-  let (eqs, t, _, _) = mkTypeEquations [] 0 0 term
+  let (eqs, t) = evalState (mkTypeEquations [] term) (0, 0)
    in do
         (subT, subU) <- unify eqs
         case substituteU subU $ substituteT subT (A t) of
